@@ -1,5 +1,5 @@
 {
-    "$schema": "https://github.com/OpenRiak/.github/admin/schema/config.schema.json",
+    "$schema": "https://raw.githubusercontent.com/OpenRiak/admin/refs/heads/openriak/schema/gh-admin.config.schema.json",
     "repos": "{{etc}}/active-source.repos",
     "teams": "{{etc}}/active-source.teams"
 }
