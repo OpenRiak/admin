@@ -1,0 +1,5 @@
+{
+    "$schema": "https://github.com/OpenRiak/.github/admin/schema/config.schema.json",
+    "repos": "{{etc}}/active-source.repos",
+    "teams": "{{etc}}/active-source.teams"
+}

@@ -1,0 +1,111 @@
+[
+  {
+    "comment": [
+      "Top-level 'comment' elements are ignored by the consuming script.",
+      "Rule elements are created/updated (based on 'name' comparison) in",
+      " target repos.",
+      "'bypass_actors.actor_name' elements are replaced by their corresponding",
+      " 'actor_id' element.",
+      "Note that these rules are interdependent to get the permissions we want;",
+      " they MUST be edited as a set.",
+      "Nota Bene: IMPORTANT! Rules are matched by their 'name' attribute -",
+      " DO NOT simply rename a rule here, it's much more involved than that.",
+      " Some manner of 'rename-repo-rule' command will be added if needed."
+    ]
+  },
+  {
+    "comment": [
+      "Only the 'BranchMaint' team can create/modify non-team branches.",
+      "'include' rules from each explicit team that follows go in 'exclude' here."
+    ],
+    "name": "Branch pattern permissions for team 'BranchMaint'",
+    "target": "branch",
+    "enforcement": "active",
+    "conditions": {
+      "ref_name": {
+        "exclude": [
+          "refs/heads/{nhse,tiot,wday}-develop-?.?",
+          "refs/heads/{nhse,tiot,wday}/**"
+        ],
+        "include": [
+          "refs/heads/*",
+          "refs/heads/.*"
+        ]
+      }
+    },
+    "bypass_actors": [
+      { "actor_name": "BranchMaint", "actor_type": "Team", "bypass_mode": "always" }
+    ],
+    "rules": [
+      { "type": "creation" },
+      { "type": "deletion" },
+      { "type": "update" }
+    ]
+  },
+  {
+    "name": "Branch pattern permissions for team 'nhse'",
+    "target": "branch",
+    "enforcement": "active",
+    "conditions": {
+      "ref_name": {
+        "exclude": [],
+        "include": [
+          "refs/heads/nhse-develop-?.?",
+          "refs/heads/nhse/**"
+        ]
+      }
+    },
+    "bypass_actors": [
+      { "actor_name": "nhse", "actor_type": "Team", "bypass_mode": "always" }
+    ],
+    "rules": [
+      { "type": "creation" },
+      { "type": "deletion" },
+      { "type": "update" }
+    ]
+  },
+  {
+    "name": "Branch pattern permissions for team 'tiot'",
+    "target": "branch",
+    "enforcement": "active",
+    "conditions": {
+      "ref_name": {
+        "exclude": [],
+        "include": [
+          "refs/heads/tiot-develop-?.?",
+          "refs/heads/tiot/**"
+        ]
+      }
+    },
+    "bypass_actors": [
+      { "actor_name": "tiot", "actor_type": "Team", "bypass_mode": "always" }
+    ],
+    "rules": [
+      { "type": "creation" },
+      { "type": "deletion" },
+      { "type": "update" }
+    ]
+  },
+  {
+    "name": "Branch pattern permissions for team 'wday'",
+    "target": "branch",
+    "enforcement": "active",
+    "conditions": {
+      "ref_name": {
+        "exclude": [],
+        "include": [
+          "refs/heads/wday-develop-?.?",
+          "refs/heads/wday/**"
+        ]
+      }
+    },
+    "bypass_actors": [
+      { "actor_name": "wday", "actor_type": "Team", "bypass_mode": "always" }
+    ],
+    "rules": [
+      { "type": "creation" },
+      { "type": "deletion" },
+      { "type": "update" }
+    ]
+  }
+]

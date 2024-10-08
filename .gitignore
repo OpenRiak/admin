@@ -1,0 +1,24 @@
+# ===== Common Development Tools =====
+*.bak
+*.dump
+*.iml
+*.orig
+*.sublime-project
+*.sublime-workspace
+*.sw?
+*.tmp
+*~
+.DS_Store
+.concrete/
+.idea/
+.project
+.settings/
+.tm_properties
+.vscode/
+tags
+tmp/
+
+# ===== Project Specific =====
+*.dis
+*.pyc
+*.txt

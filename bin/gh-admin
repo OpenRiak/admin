@@ -1,0 +1,955 @@
+#!/usr/bin/python3
+# ===================================================================
+#
+# Copyright (c) 2022-2024 Workday, Inc.
+#
+# This file is provided to you under the Apache License,
+# Version 2.0 (the "License"); you may not use this file
+# except in compliance with the License.  You may obtain
+# a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# ===================================================================
+#
+# Usage: gh-admin [options] command parameter ...
+#
+# Run "gh-admin -h" for help.
+#
+# Requires Python >= 3.8 for the walrus operator ':=', used throughout.
+#
+# Very much work-in-progress, you almost certainly have to get into the code
+# to add the functionality you want.
+#
+# ToDo: Refactor! This thing is huge, it was the easiest way to get it running.
+#
+
+# Add our 'lib' directory to the module search path if not already there.
+import scr
+
+import argparse
+import json
+import keyword
+import logging
+import os
+import re
+import sys
+import textwrap
+import traceback
+import urllib.parse
+import urllib.request
+
+from http.client import HTTPResponse
+from typing import (
+    Any,
+    Callable,
+    Mapping,
+    NoReturn,
+    Optional,
+    Sequence,
+    TextIO,
+    Union
+)
+
+# ===================================================================
+# Type Aliases
+# ===================================================================
+
+# Simple
+Cache   = dict[str, Any]
+Headers = dict[str, str]
+JSON    = dict[str, Any]
+ObjID   = int
+Query   = Mapping[str, Any]
+
+# Derived
+Config  = Mapping[str, Union[bool, int, str, scr.CmdArgs]]
+IdNames = Mapping[ObjID, scr.Name]
+NameIds = Mapping[scr.Name, ObjID]
+Rule    = JSON
+Rules   = Sequence[Rule]
+
+# ===================================================================
+# GitHub API
+# ===================================================================
+
+FoldAccumulator = Any
+PageFoldCallback = Callable[[FoldAccumulator, JSON], FoldAccumulator]
+
+# 100 per page is the GH maximum
+GH_RECS_PER_PAGE: int = 100
+
+class GitHub:
+
+    # ===================================================================
+    # Commands
+    # ===================================================================
+
+    def dispatch(self, cmd_name: scr.CmdName, cmd_args: scr.CmdArgs) -> None:
+        """Command dispatcher."""
+        fun_name = cmd_name.replace('-', '_')
+        if fun_name == 'dispatch' or keyword.iskeyword(fun_name) or not \
+                re.fullmatch(r'^[a-z]\w+$', fun_name, re.ASCII):
+            raise scr.CommandError(f"Illegal command '{cmd_name}'")
+        inst_fun = getattr(self, fun_name, None)
+        if not callable(inst_fun):
+            raise scr.CommandError(f"Invalid command '{cmd_name}'")
+        if cmd_args:
+            inst_fun(cmd_args)
+        else:
+            inst_fun()
+
+    CmdHelp: str = textwrap.dedent("""
+    Commands:
+
+        branches -r repo [-t {all | <team>,...}]
+            Prints the names of the repo's branches that are prefixed with the
+            specified team name(s). If no teams are specified, the teams returned
+            by the 'teams' command are used to construct the filter. The special
+            team 'all' turns off filtering and prints all branch names in the reop.
+
+        repos
+            Prints all configured repository names or, if no repository list is
+            configured, all of the repositories in the project.
+
+        teams [-v]
+            Prints all configured team names or, if no teams list is configured, all
+            of the teams in the project.
+            The '-v' flag causes team IDs to be printed along with team names.
+
+        get-repo-rules [-m] [-v] [-j OutFile] [-r <repo>,...]
+            Prints JSON permission rules for the specified or configured repos.
+            The '-j' option causes output to be written to the specified file.
+            The '-m' flag causes actor IDs to be de-referenced into actor names.
+            The '-v' flag causes source and timestamp information to be appended
+            to the output.
+            NOTE: Use of the '-m' and/or '-v' flags results in JSON that is not
+            conformant with the GH schema and MAY NOT be accepted in a subsequent
+            external update operation as-is.
+
+        set-default-rules [-r <repo>,...]
+            Sets (or updates) default permission rules for the specified or
+            configured repos.
+            The per-repo rules are defined in '<etc-dir>/default-rules.json'.
+
+        set-repo-rules -j JsonFile
+            Sets permission rules from the specified input JSON file. Additions
+            to the input file made by get-repo-rules are reverted before updating
+            server rules.
+    -""")
+
+    def get_repo_rules(self) -> None:
+        map_actors: bool = self._cache.get('map_actors', False)
+        for repo in self._repos():
+            if rules := self._repo_rules(repo):
+                if out_file := self._cache.get('json'):
+                    with open(out_file, 'wt') as fd:
+                        self._print_rules(
+                            rules, map_actors=map_actors, stream=fd)
+                else:
+                    self._print_rules(rules, map_actors=map_actors)
+            else:
+                print(f"{self._org}/{repo}: no rules")
+
+    def set_default_rules(self) -> None:
+        rules: Rules = self._default_repo_rules()
+        proj = self._org
+        for repo in self._repos():
+            rname= f"{proj}/{repo}"
+            print(f"{rname} ...")
+            rpath: str = f"/repos/{rname}/rulesets"
+            existing: NameIds = self._repo_rule_ids(repo)
+            for rule in rules:
+                if rid := existing.get(rule['name']):
+                    # Update
+                    path = f"{rpath}/{rid}"
+                    self._send(path, 'PUT', rule)
+                else:
+                    # Create
+                    self._send(rpath, 'POST', rule, ok=(201,))
+
+    def set_repo_rules(self) -> None:
+        if not (file := self._cache.get('json')):
+            raise scr.CommandError("missing JSON file specification")
+        jsin: list[JSON]
+        with open(file, 'rt') as fd:
+            jsin = json.load(fd)
+        jsok: list[JSON] = [self._sanitized_rule(r) for r in jsin]
+        proj_nocase = self._org.casefold()
+        target_repos: set[scr.Name] = set()
+        target_rules: dict[scr.Name, list[JSON]] = {}
+        # GH doesn't want the source info, but we want the repos
+        for rec in jsok:
+            if rec.pop('source_type') != 'Repository':
+                # Only other type is 'Organization', and we don't have them
+                continue
+            source = rec['source']
+            fields = source.split('/')
+            if len(fields) != 2 or fields[0].casefold() != proj_nocase:
+                # Not ours???
+                raise scr.CommandError(f"invalid source repo: '{source}'")
+            repo = fields[1]
+            target_repos.add(repo)
+            if recs := target_rules.get(repo):
+                recs.append(rec)
+            else:
+                target_rules[repo] = [rec]
+        target_repos: Sequence[scr.Name] = tuple(target_repos)
+        # Proj/Repo => rules
+        existing: dict[scr.Name, Rules] = {}
+        for repo in target_repos:
+            existing[repo] = self._repo_rules(repo)
+        for repo, recs in target_rules.items():
+            xrecs: list[Rule] = existing[repo]
+            for rec in recs:
+                source = rec.pop('source')
+                if not (rid := rec.pop('id', None)):
+                    name = rec['name']
+                    for xrec in xrecs:
+                        if xrec['name'] == name:
+                            rid = xrec['id']
+                            break
+                if rid:
+                    # Update - on success, we're done with this one
+                    path = f"/repos/{source}/rulesets/{rid}"
+                    self._send(path, 'PUT', rec)
+                else:
+                    # Create - on success, add it to the existing ones in
+                    # case there's a duplicate in the file
+                    path = f"/repos/{source}/rulesets"
+                    res = self._send(path, 'POST', rec, ok=(201,))
+                    jsout = json.load(res)
+                    # populate missing fields
+                    for key in 'id', 'source', 'source_type':
+                        rec[key] = jsout[key]
+                    xrecs.append(rec)
+
+    def branches(self) -> None:
+        repos = self._repos()
+        if len(repos) != 1:
+            raise scr.CommandError(f"specify exactly one repo")
+        for branch in self._branches(repos[0]):
+            print(branch)
+
+    def repos(self) -> None:
+        for repo in self._repos():
+            print(repo)
+
+    def teams(self) -> None:
+        if self._cache.get('verbose'):
+            # Print teams and their IDs
+            for team, tid in self._team_ids().items():
+                print(f"{team}\t{tid}")
+        else:
+            # Print only team names
+            for team in self._teams():
+                print(team)
+
+    # undocumented, for testing pre-command processing only
+    def no_op(self, args: Optional[Sequence[scr.CmdArgs]] = None) -> None:
+        if args:
+            print(f"Invocation: no_op({args})")
+        else:
+            print("Invocation: no_op()")
+
+    # ===================================================================
+    # Internal Implementation
+    # ===================================================================
+
+    def _branches(self, repo: str, teams: Optional[scr.Names] = None) -> scr.Names:
+        patt = self._team_branch_re(teams)
+        bns = self._paged_rec_names(f"/repos/{self._org}/{repo}/branches")
+        return sorted(filter(patt.match, bns))
+
+    def _repos(self) -> scr.Names:
+        repos = self._cache.get('repos')
+        if not repos:
+            repos = self._paged_rec_names(
+                f"/orgs/{self._org}/repos", {'sort': 'full_name'})
+            self._cache['repos'] = repos
+        return repos
+
+    def _teams(self) -> scr.Names:
+        teams: scr.Names
+        if not (teams := self._cache.get('teams')):
+            # populate the cache
+            self._team_ids()
+            teams = self._cache['teams']
+        return teams
+
+    def _team_ids(self) -> NameIds:
+        tids: dict[scr.Name, ObjID]
+        if not (tids := self._cache.get('team_ids')):
+            team_name_ids = self._team_id_cache()[0]
+            if teams := self._cache.get('teams'):
+                tids = {}
+                for team in teams:
+                    tids[team] = team_name_ids[team]
+            else:
+                tids = team_name_ids
+                self._cache['teams'] = tuple(tids.keys())
+            self._cache['team_ids'] = tids
+        return tids
+
+    def _team_id_cache(self) -> (NameIds, IdNames):
+        team_name_ids: NameIds
+        team_id_names: IdNames
+        if team_name_ids := self._cache.get('team_name_ids'):
+            team_id_names = self._cache['team_id_names']
+        else:
+            team_name_ids = self._paged_rec_name_ids(
+                f"/orgs/{self._org}/teams", {'sort': 'full_name'})
+            team_id_names: dict[ObjID, scr.Name] = {}
+            for t, i in team_name_ids.items():
+                team_id_names[i] = t
+            self._cache['team_name_ids'] = team_name_ids
+            self._cache['team_id_names'] = team_id_names
+        return (team_name_ids, team_id_names)
+
+    def _default_repo_rules(self) -> Rules:
+        with open(scr.resolve_conf_path('{{etc}}/default-rules.json')) as fd:
+            recs: list[JSON] = json.load(fd)
+        Actors = list[dict[str, Union[int, str]]]
+        team_name_ids: NameIds = self._team_id_cache()[0]
+        rules: list[Rule] = []
+        for rec in recs:
+            rec.pop('comment', None)
+            if rec:
+                if unmapped := rec.get('bypass_actors'):
+                    unmapped: Actors
+                    mapped: Actors = []
+                    for actor in unmapped:
+                        if an := actor.pop('actor_name', None):
+                            if 'actor_id' not in actor \
+                                    and actor['actor_type'] == 'Team':
+                                actor['actor_id'] = team_name_ids[an]
+                        mapped.append(actor)
+                    rec['bypass_actors'] = mapped
+                rules.append(rec)
+        return rules
+
+    def _repo_rule_ids(self, repo: scr.Name) -> NameIds:
+        rids: dict[scr.Name, ObjID] = {}
+        for rule in self._repo_rules(repo):
+            rids[rule['name']] = rule['id']
+        return rids
+
+    def _repo_rules(self, repo: scr.Name) -> Rules:
+        path = f"/repos/{self._org}/{repo}/rulesets"
+        rules: list[Rule] = []
+        for rec in self._paged_recs(path):
+            rp = f"{path}/{rec['id']}"
+            res = self._recv(rp, 'GET')
+            rules.append(json.load(res))
+        return rules
+
+    def _sanitized_rule(self, rule: Rule) -> Rule:
+        rule_keys = GitHub._get_rule_keys
+        clean: Rule = scr.dict_with(rule, rule_keys)
+        for key in rule_keys[1:]:
+            if key not in clean:
+                raise GitHubError(f"missing key '{key}'")
+        # Filter out added ID => name mappings
+        acts0: list[dict[str, Union[int, str]]] = clean['bypass_actors']
+        acts1: list[dict[str, Union[int, str]]] = []
+        for act in acts0:
+            if an := act.pop('actor_name', None):
+                if 'actor_id' not in act and act['actor_type'] == 'Team':
+                    team_name_ids = self._team_id_cache()[0]
+                    act['actor_id'] = team_name_ids[an]
+            acts1.append(act)
+        clean['bypass_actors'] = acts1
+        return clean
+
+    def _team_branch_re(self, teams: Optional[scr.Names]) -> re.Pattern:
+        if not teams:
+            teams = self._teams()
+        if teams and teams[0] == 'all':
+            return re.compile(r'^.')
+        if len(teams) > 1:
+            patt = '^(' + '|'.join(teams) + ')-'
+        else:
+            patt = '^' + teams[0] + '-'
+        return re.compile(patt)
+
+    def _paged_rec_names(
+            self, path: str,
+            initial_query: Optional[Query] = None) -> scr.Names:
+        """
+        Get the names of the JSON records returned from `path`.
+        :param path: The GH REST API path, beginning with '/'.
+        :param initial_query: Initial query parameters.
+            If `per_page` is unset the default is used.
+            If `page` is unset paging starts at `1`.
+            Any other mappings are used unchanged.
+            The input object is unchanged.
+        :return: All of the records' `name` attributes in the order returned.
+        """
+        return tuple(self._fold_pages(
+            path, GitHub._cb_rec_names, [], initial_query))
+
+    def _paged_rec_name_ids(
+            self, path: str,
+            initial_query: Optional[Query] = None) -> NameIds:
+        """
+        Get the `name => id` mappings of the JSON records returned from `path`.
+        :param path: The GH REST API path, beginning with '/'.
+        :param initial_query: Initial query parameters.
+            If `per_page` is unset the default is used.
+            If `page` is unset paging starts at `1`.
+            Any other mappings are used unchanged.
+            The input object is unchanged.
+        :return: A `Mapping` of `name => id`.
+        """
+        return self._fold_pages(
+            path, GitHub._cb_rec_name_ids, {}, initial_query)
+
+    def _fold_pages(
+            self, path: str,
+            callback: PageFoldCallback,
+            accumulator: FoldAccumulator,
+            initial_query: Optional[Query] = None) -> FoldAccumulator:
+        """
+        Ingest records from a paged API path.
+        :param path: The GH REST API path, beginning with '/'.
+        :param callback: Fold callback, invoked with each JSON object returned
+            by GET on `path`.
+            The function returns the `accumulator` to be passed to its next
+            invocation. The result of the last invocation is returned.
+        :param accumulator: Initial accumulator value.
+            Whether the input object is changed is determined by the
+            `callback` implementation.
+        :param initial_query: Initial query parameters.
+            If `per_page` is unset the default is used.
+            If `page` is unset paging starts at `1`.
+            Any other mappings are used unchanged.
+            The input object is unchanged.
+        :return: The final `accumulator`.
+        """
+        acc = accumulator
+        for rec in self._paged_recs(path, initial_query):
+            acc = callback(acc, rec)
+        return acc
+
+    def _paged_recs(
+            self, path: str,
+            initial_query: Optional[Query] = None) -> list[JSON]:
+        """
+        Collect records from a paged API path.
+        :param path: The GH REST API path, beginning with '/'.
+        :param initial_query: Initial query parameters.
+            If `per_page` is unset the default is used.
+            If `page` is unset paging starts at `1`.
+            Any other mappings are used unchanged.
+            The input object is unchanged.
+        :return: A list of the returned records in the order received.
+        """
+        query: dict[str, Union[str, int]]
+        if initial_query:
+            if isinstance(initial_query, dict):
+                query = initial_query.copy()
+            else:
+                query = dict(initial_query)
+            if 'per_page' not in query:
+                query['per_page'] = GH_RECS_PER_PAGE
+        else:
+            query = {'per_page': GH_RECS_PER_PAGE}
+        page: Optional[int] = query.get('page', 1)
+        recs = []
+        append_rec  = recs.append
+        append_list = recs.extend
+        while page:
+            query['page'] = page
+            res = self._recv(path, 'GET', query=query)
+            page = self._parse_next_page(res)
+            js = json.load(res)
+            if isinstance(js, list):
+                append_list(js)
+            else:
+                append_rec(js)
+        return recs
+
+    def _recv(self, path: str, op: str, ok: Sequence[int] = (200,),
+              query: Optional[Query] = None) -> HTTPResponse:
+        url = self._url(path, query)
+        req = urllib.request.Request(
+            url, headers=self._headers, method=op)
+        return self._rest_op(req, ok)
+
+    def _send(self, path: str, op: str, data: JSON, ok: Sequence[int] = (200,),
+              query: Optional[Query] = None) -> HTTPResponse:
+        url = self._url(path, query)
+        content = json.dumps(data).encode()
+        req = urllib.request.Request(
+            url, headers=self._headers, method=op, data=content)
+        return self._rest_op(req, ok)
+
+    def _rest_op(self,
+            req: urllib.request.Request, ok: Sequence[int]) -> HTTPResponse:
+        method = req.get_method()
+        logging.info(f"{method}: {req.full_url}")
+        if method in ('PUT', 'POST'):
+            logging.info(f"{method}: {req.data}")
+        res: HTTPResponse = self._opener.open(req)
+        # We can't log the result body here, as it's read-once, but we can
+        # log the URL and status.
+        status = res.status
+        logging.info(f"{method}: {status}: {res.reason}")
+        if status not in ok:
+            GitHub._bad_status(res)
+        return res
+
+    def _url(self, path: str, query: Optional[Query] = None) -> str:
+        if query:
+            q_quot = urllib.parse.urlencode(
+                query, doseq=True, safe='', quote_via=urllib.parse.quote)
+        else:
+            q_quot = ''
+        p_quot = urllib.parse.quote(path)
+        parts = ('https', 'api.github.com', p_quot, q_quot, '')
+        return urllib.parse.urlunsplit(parts)
+
+    def _parse_next_page(self, res: HTTPResponse) -> Optional[int]:
+        # patt = self._cache.get('next_page_re')
+        if not (patt := self._cache.get('next_page_re')):
+            patt = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
+            self._cache['next_page_re'] = patt
+        if hl := res.headers.get('link'):
+            if url := patt.findall(hl):
+                q_str = urllib.parse.urlparse(url[0]).query
+                q_dict = dict(urllib.parse.parse_qsl(q_str))
+                return int(q_dict['page'])
+
+    def __init__(self, conf: Config):
+        self._org: str = conf['project']
+        self._headers: Headers = {
+            'Authorization':        conf['auth'],
+            'Accept':               'application/vnd.github+json',
+            'Content-Type':         'application/vnd.github+json',
+            'User-Agent':           f"{self._org}-{scr.PROG_NAME}",
+            'X-GitHub-Api-Version': '2022-11-28'
+        }
+        self._opener: urllib.request.OpenerDirector = \
+            urllib.request.build_opener(GitHub._ErrorPassThru)
+        # load cache from optional config entries
+        cache: Cache = {}
+        for key in _cache_seqs:
+            if val := conf.get(key):
+                if isinstance(val, str):
+                    # it's a file, read it as a list of words
+                    val = scr.read_file(scr.resolve_conf_path(val)).split()
+                # whether read from a file or from config, it's now a list
+                # de-duplicate regardless of source
+                cache[key] = tuple(frozenset(val))
+        for key in _cache_asis:
+            if val := conf.get(key):
+                cache[key] = val
+        self._cache: Cache = cache
+        indent = conf['indent']
+        self._indent: int = indent
+        self._curind: int = 0
+        self._spaces: str = ' ' * (indent * 4)
+
+    # ===================================================================
+    # Rule Formatting
+    # Yeah, it's overkill, but it started out SO much simpler ...
+    # ===================================================================
+
+    _req_rule_keys: tuple[str, ...] = (
+        'name', 'enforcement', 'target', 'bypass_actors', 'conditions', 'rules')
+    _get_rule_keys: tuple[str, ...] = (
+        'id', 'source', 'source_type') + _req_rule_keys
+    _all_rule_keys: tuple[str, ...] = _get_rule_keys + (
+        'created_at', 'updated_at', '_links')
+
+    def _print_rules(self,
+            rules: Rules, map_actors: bool = False,
+            stream: TextIO = sys.stdout) -> None:
+        rule_keys: tuple[str, ...] = \
+            GitHub._all_rule_keys if self._cache.get('verbose') \
+            else GitHub._get_rule_keys
+        s = self._cur_indent()
+        stream.write(f'{s}[')
+        self._inc_indent()
+        prv = False
+        for rule in rules:
+            if prv:
+                stream.write(',')
+            else:
+                prv = True
+            self._print_rule(rule, rule_keys, stream, map_actors)
+        stream.write(f'\n{s}]\n')
+
+    def _print_rule(self,
+            rule: Rule, rule_keys: Sequence[str],
+            stream: TextIO, map_actors: bool = False) -> None:
+        s = self._cur_indent()
+        stream.write(f"\n{s}{{")
+        s = self._inc_indent()
+        prv: bool = False
+        for key, val in scr.dict_with(rule, rule_keys).items():
+            if prv:
+                stream.write(',')
+            else:
+                prv = True
+            if key == 'bypass_actors':
+                self._print_rule_actors(key, val, stream, map_actors)
+            elif key == 'conditions':
+                self._print_rule_cond(key, val, stream)
+            elif key == 'rules':
+                self._print_rule_rules(key, val, stream)
+            elif key == '_links':
+                val = val['html']['href']
+                stream.write(f'\n{s}"url": "{val}"')
+            else:
+                # val is a simple value
+                if isinstance(val, str):
+                    val = '"' + val + '"'
+                stream.write(f'\n{s}"{key}": {val}')
+        s = self._dec_indent()
+        stream.write(f'\n{s}}}')
+
+    def _print_rule_actors(self,
+            key: str, vals: list[dict[str, Union[int, str]]],
+            stream: TextIO, map_actors: bool) -> None:
+        if not map_actors:
+            # Unless actors are being mapped behavior is same as for a 'rule'
+            return self._print_rule_rules(key, vals, stream)
+        team_id_names = self._team_id_cache()[1]
+        s = self._cur_indent()
+        stream.write(f'\n{s}"{key}": [')
+        s = self._inc_indent()
+        prv: bool = False
+        for val in vals:
+            if prv:
+                stream.write(',')
+            else:
+                prv = True
+            if val['actor_type'] == 'Team':
+                team = team_id_names[val['actor_id']]
+                val['actor_name'] = team
+                val = dict(sorted(val.items()))
+            stream.write(f'\n{s}')
+            GitHub._print_flat_json_dict(val, stream)
+        s = self._dec_indent()
+        stream.write(f'\n{s}]')
+
+    def _print_rule_cond(self,
+            key: str, val: dict[str, dict[str, list[str]]],
+            stream: TextIO) -> None:
+        s = self._cur_indent()
+        stream.write(f'\n{s}"{key}": {{')
+        s = self._inc_indent()
+        p1: bool = False
+        for k1, v1 in val.items():
+            if p1:
+                stream.write(',')
+            else:
+                p1 = True
+            # v1 should be a dict
+            stream.write(f'\n{s}"{k1}": {{')
+            s = self._inc_indent()
+            p2: bool = False
+            for k2, v2 in v1.items():
+                if p2:
+                    stream.write(',')
+                else:
+                    p2 = True
+                # v2 is a list
+                if v2:
+                    stream.write(f'\n{s}"{k2}": [')
+                    s = self._inc_indent()
+                    p3: bool = False
+                    for v3 in v2:
+                        if p3:
+                            stream.write(',')
+                        else:
+                            p3 = True
+                        stream.write(f'\n{s}"{v3}"')
+                    s = self._dec_indent()
+                    stream.write(f'\n{s}]')
+                else:
+                    stream.write(f'\n{s}"{k2}": {v2}')
+            s = self._dec_indent()
+            stream.write(f'\n{s}}}')
+        s = self._dec_indent()
+        stream.write(f'\n{s}}}')
+
+    def _print_rule_rules(self,
+            key: str, vals: list[dict[str, Union[int, str]]],
+            stream: TextIO) -> None:
+        s = self._cur_indent()
+        stream.write(f'\n{s}"{key}": [')
+        s = self._inc_indent()
+        prv: bool = False
+        for val in vals:
+            if prv:
+                stream.write(',')
+            else:
+                prv = True
+            stream.write(f'\n{s}')
+            GitHub._print_flat_json_dict(val, stream)
+        s = self._dec_indent()
+        stream.write(f'\n{s}]')
+
+    def _cur_indent(self) -> str:
+        return self._spaces[:self._curind]
+
+    def _inc_indent(self) -> str:
+        i = self._indent
+        c = self._curind + i
+        s = self._spaces
+        if len(s) < c:
+            s += ' ' * (i * 4)
+            self._spaces = s
+        self._curind = c
+        return s[:c]
+
+    def _dec_indent(self) -> str:
+        c = self._curind - self._indent
+        self._curind = c
+        return self._spaces[:c]
+
+    # ===================================================================
+    # Static Helpers
+    # ===================================================================
+
+    class _ErrorPassThru(urllib.request.HTTPErrorProcessor):
+        def http_response(self, request, response):
+            return response
+        def https_response(self, request, response):
+            return response
+
+    @staticmethod
+    def _bad_status(res: HTTPResponse) -> NoReturn:
+        msg = f"Unexpected failure: {res.url} => {res.status}: {res.reason}"
+        raise GitHubError(msg)
+
+    @staticmethod
+    def _cb_rec_names(acc: list[str], rec: JSON) -> list[str]:
+        acc.append(rec['name'])
+        return acc
+
+    @staticmethod
+    def _cb_rec_name_ids(
+            acc: dict[str, ObjID], rec: JSON) -> dict[str, ObjID]:
+        acc[rec['name']] = rec['id']
+        return acc
+
+    @staticmethod
+    def _print_flat_json_dict(
+            vals: dict[str, Any], stream: TextIO) -> None:
+        prv: bool = False
+        for key, val in vals.items():
+            if prv:
+                delim = ', '
+            else:
+                delim = '{'
+                prv = True
+            if isinstance(val, str):
+                val = '"' + val + '"'
+            stream.write(f'{delim}"{key}": {val}')
+        stream.write('}')
+
+class GitHubError(Exception):
+    pass
+
+# ===================================================================
+# Internal
+# ===================================================================
+
+# Name sequences to cache that can be either a file or list from config
+_cache_seqs: tuple[str, ...] = ('repos', 'teams')
+
+# Config values to cache as-is
+_cache_asis: tuple[str, ...] = ('indent', 'json', 'map_actors', 'verbose')
+
+_cfg_schema: scr.FsPath = \
+    os.path.join(scr.SCH_DIR, 'gh-admin.config.schema.json')
+
+# ===================================================================
+# Main
+# ===================================================================
+
+def main(argv: list[str]) -> NoReturn:
+    # Look for the debug switch on the command line to set it before parsing.
+    # The parser will handle it properly so we don't need to consume it, but
+    # validator exceptions will be swallowed if it's not set beforehand.
+    if debug := ('-d' in argv):
+        scr.debug = debug
+        print('Using Python ' + scr.vsn_to_semver(sys.version_info[:3]),
+              file=sys.stderr)
+    try:
+        conf: Config = _init_config()
+        # if scr.debug:
+        #     import dis
+        #     src = __file__
+        #     lst = src + '.dis'
+        #     with open(lst, 'wt') as fd:
+        #         dis.dis(GitHub, file=fd)
+        gh = GitHub(conf)
+        gh.dispatch(conf['cmd'], conf['args'])
+    except Exception:
+        si = sys.exc_info()
+        tb = si[2] if scr.debug else None
+        traceback.print_exception(si[0], si[1], tb)
+        sys.exit(1)
+
+def _init_config() -> Config:
+    defaults: Config = _schema_defaults()
+    args: Config = _parse_config(defaults)
+    # Set this first so it's in effect if an exception is raised.
+    scr.debug = args['debug']
+    # Load the specified or default config file.
+    conf_json: Optional[str] = None
+    if cf := args['conf']:
+        # if specified it's been confirmed to exist
+        conf_json = scr.read_file(cf)
+    else:
+        # default paths may not exist
+        cf = defaults['config']
+        for cf in os.path.join(scr.CUR_DIR, cf), os.path.join(scr.ETC_DIR, cf):
+            if os.path.isfile(cf):
+                if scr.debug:
+                    print(f"Loading config from '{cf}'", file=sys.stderr)
+                conf_json = scr.read_file(cf)
+                break
+    conf = json.loads(conf_json) if conf_json else {}
+    # Next setup etc redirection, if any, so scr.resolve_conf_path() works.
+    # This can only come from a config file, not the command line args.
+    if etc := conf.get('etc-dir'):
+        scr.ETC_DIR = scr.ReadableDir(etc)
+        if scr.debug:
+            print(f"Using alternate etc dir: '{scr.ETC_DIR}'", file=sys.stderr)
+    # Set up logging with command-line level, if specified.
+    if ll := args.get('log'):
+        conf['log-level'] = ll
+    scr.init_log(
+        conf.get('log-level', defaults['log-level']),
+        conf.get('log-dir'), conf.get('log-name'))
+    # There MUST be a credentials file, whether specified or default.
+    if not (af := args['auth']):
+        if not (af := conf.pop('creds', None)):
+            af = defaults['creds']
+    conf['auth'] = _auth_token(scr.resolve_conf_path(af))
+    # Always present.
+    conf['cmd'] = args['cmd']
+    conf['args'] = args['args']
+    # One last default.
+    if 'project' not in conf:
+        conf['project'] = defaults['project']
+    # Remaining command-line args and overrides
+    for name in (_cache_asis + _cache_seqs):
+        if val := args.get(name, None):
+            conf[name] = val
+    return conf
+
+def _parse_config(defaults: Config) -> Config:
+    p: argparse.ArgumentParser = argparse.ArgumentParser(
+        description='Administer GitHub repositories',
+        epilog=GitHub.CmdHelp,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument(
+        'cmd', metavar='command',
+        help='Command to execute.')
+    p.add_argument(
+        'args', metavar='param', nargs='*',
+        help='Command parameter(s).')
+    s = _cfg_schema
+    c = scr.CUR_DIR
+    l = len(c)
+    if os.path.commonpath((s, c)) == c:
+        s = '.' + s[l:]
+    e = scr.ETC_DIR
+    if os.path.commonpath((e, c)) == c:
+        e = '.' + e[l:]
+    c = defaults['config']
+    p.add_argument(
+        '-c', '--conf', metavar='File', type=scr.ReadableFile,
+        help=f"""Config file to read, conforming to schema '{s}'.
+        Some options are only available with a config file.
+        Default: './{c}' or '{os.path.join(e, c)}'""")
+    p.add_argument(
+        '-a', '--auth', metavar='File', type=scr.ReadableFile,
+        help=f"Credentials file to read. Default: {defaults['creds']}")
+    s = [l.lower() for l in scr.LOG_LEVELS.keys()]
+    p.add_argument(
+        '-l', '--level', metavar='Lvl', choices=s,
+        help=f"""Log level, one of [{', '.join(s)}].
+        Default: {defaults['log-level'].lower()}""")
+    p.add_argument(
+        '-d', '--debug', action='store_true',
+        help=f"""Print some additional info from certain operations.
+        On exception print stack trace. Debug output is always to stderr, so
+        it doesn't interfere with stdout redirection. Default: False""")
+    p.add_argument(
+        '-r', '--repos', metavar='...', type=scr.NamesListOrFile,
+        help="""Specify one or more repos explicitly, overriding config file
+        or defaults.
+        If the argument is prefixed with '@' the value following the prefix
+        must refer to an existing readable file, which is read and parsed as
+        if its contents were entered on the command line as a quoted string.
+        The parameter value is parsed as a comma-or-whitespace-delimited list
+        of repo names, de-duplicated after parsing.""")
+    p.add_argument(
+        '-t', '--teams', metavar='...', type=scr.NamesListOrFile,
+        help="""Specify one or more teams explicitly, overriding config file
+        or defaults.
+        If the argument is prefixed with '@' the value following the prefix
+        must refer to an existing readable file, which is read and parsed as
+        if its contents were entered on the command line as a quoted string.
+        The parameter value is parsed as a comma-or-whitespace-delimited list
+        of team names, de-duplicated after parsing.""")
+    indent  = defaults['indent']
+    indmin = defaults['min_indent']
+    indmax = defaults['max_indent']
+    s = f"{indmin}-{indmax}"
+    p.add_argument(
+        '-i', '--indent', metavar=s, type=int,
+        choices=range(indmin, indmax+1), default=indent,
+        help=f"""Indent spaces for output, primarily JSON.
+        Valid range is {s}. Default: {indent}""")
+    p.add_argument(
+        '-j', '--json', metavar='File', type=scr.PossibleFile,
+        help='JSON file to read or write for commands recognizing it.')
+    p.add_argument(
+        '-m', '--map', dest='map_actors', action='store_true',
+        help='Map numeric IDs to names for commands recognizing it.')
+    p.add_argument(
+        '-v', '--verbose', action='store_true',
+        help="""Make certain operations more verbose.
+        The effect of this flag varies by operation, refer to command help
+        for details.""")
+    return vars(p.parse_args())
+
+def _schema_defaults() -> Config:
+    with open(_cfg_schema, 'rt') as fd:
+        schema = json.load(fd)
+    defaults = {'config': schema['default']}
+    props = schema['properties']
+    for name in 'creds', 'log-level', 'project':
+        defaults[name] = props[name]['default']
+    indent = props['indent']
+    defaults['indent'] = indent['default']
+    defaults['min_indent'] = indent['minimum']
+    defaults['max_indent'] = indent['maximum']
+    return defaults
+
+def _auth_token(cred_file: str) -> str:
+    body = scr.read_file(cred_file)
+    opt = (re.ASCII | re.MULTILINE)
+    # GH access tokens start with 'ghp_'
+    for tok in re.findall(r'^github\.token=(.+)$', body, opt):
+        if tok.startswith('ghp_'):
+            # GH requires a 'Bearer' token
+            return 'Bearer ' + tok
+    raise ValueError(f"Credentials not complete in {cred_file}")
+
+main(sys.argv[1:])

@@ -1,0 +1,97 @@
+{
+    "$id": "https://github.com/OpenRiak/.github/admin/schema/config.schema.json",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "GitHub-Admin-Config",
+    "description": "Configuration for the gh-admin script.",
+    "type": "object",
+    "default": "config.json",
+    "properties": {
+        "creds": {
+            "description": "Credentials file to read. The value is subject to '~' and '{{etc}}' (see 'etc-dir') expansion.",
+            "type": "string",
+            "default": "~/.github.credentials",
+            "$comment": "file containing 'github.token=<ghp_token><EOL>'"
+        },
+        "etc-dir": {
+            "description": "The configuration directory, absolute or relative to the CWD. The value is subject to '~' expansion. The effective value, as an absolute path, replaces the pattern '{{etc}}' at the beginning of file/path values where noted.",
+            "type": "string",
+            "default": "{{script-dir}}/../etc"
+        },
+        "indent": {
+            "description": "Indent spaces for output, primarily JSON.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8,
+            "default": 2
+        },
+        "log-dir": {
+            "description": "The log directory, absolute or relative to the CWD. The value is subject to '~' and '{{etc}}' (see 'etc-dir') expansion.",
+            "type": "string",
+            "default": "./log"
+        },
+        "log-name": {
+            "description": "The base name of the log file.",
+            "type": "string",
+            "default": "{{script-name}}"
+        },
+        "log-level": {
+            "description": "The log filtering level. 'ALL' is equivalent to 'NOTSET'. 'NONE' disables logging entirely. See https://docs.python.org/3/library/logging.html#levels",
+            "type": "string",
+            "enum": ["ALL", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "NONE"],
+            "default": "INFO"
+        },
+        "project": {
+            "description": "The target GitHub project.",
+            "type": "string",
+            "pattern": "^[\\w\\.-]+$",
+            "default": "OpenRiak"
+        },
+        "repos": {
+            "description": "Repositories to act upon. Default is all public repos in the project.",
+            "oneOf": [
+                {
+                    "description": "A list of unique repository names.",
+                    "type": "array",
+                    "items": {
+                        "description": "A single unique repository name.",
+                        "type": "string",
+                        "pattern": "^[\\w\\.-]+$"
+                    },
+                    "uniqueItems": true
+                },
+                {
+                    "description": "File containing a whitespace-delimited list of repository names. The value is subject to '~' and '{{etc}}' (see 'etc-dir') expansion.",
+                    "type": "string",
+                    "$comment": "The entries in the file are de-duplicated before processing."
+                }
+            ]
+        },
+        "teams": {
+            "description": "Teams to act upon. Default is all teams in the project.",
+            "oneOf": [
+                {
+                    "description": "A list of unique team names.",
+                    "type": "array",
+                    "items": {
+                        "description": "A single unique team name.",
+                        "type": "string",
+                        "pattern": "^[\\w\\.-]+$"
+                    },
+                    "uniqueItems": true
+                },
+                {
+                    "description": "File containing a whitespace-delimited list of team names. The value is subject to '~' and '{{etc}}' (see 'etc-dir') expansion.",
+                    "type": "string",
+                    "$comment": "The entries in the file are de-duplicated before processing."
+                }
+            ]
+        },
+        "$schema": {
+            "description": "If present, the value must be this schema's path/URL",
+            "type": "string",
+            "format": "uri",
+            "pattern": ".*[/\\.]config.schema.json"
+        }
+    },
+    "additionalProperties": false
+}
