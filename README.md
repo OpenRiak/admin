@@ -2,7 +2,7 @@
 
 Scripting for administering stuff in the repos.
 
-## gh-admin
+## `gh-admin`
 
 Invoke `bin/gh-admin -h` to see what it offers.
 

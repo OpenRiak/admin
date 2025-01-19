@@ -1,0 +1,107 @@
+#!/usr/bin/python3
+# ===================================================================
+#
+# Copyright (c) 2025 Workday, Inc.
+#
+# This file is provided to you under the Apache License,
+# Version 2.0 (the "License"); you may not use this file
+# except in compliance with the License.  You may obtain
+# a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# ===================================================================
+#
+# Prints info about how a repo can be detached.
+#
+# Usage: unfork-info [options] <repo>
+#
+# Recognizes -d|--debug flag, allows but ignores -v|--verbose flag.
+#
+# Add our 'lib' directory to the module search path if not already there.
+# Your editor will tell you this isn't used - don't believe it, it matters!
+import libpath
+
+import argparse
+import gh
+import json
+import scr
+import sys
+
+from gh import GitHubRest, Repo
+
+class UnforkInfo(GitHubRest):
+
+    def print_info(self, repo: str):
+        rrec = json.load(self._recv(f"/repos/{self._org}/{repo}", 'GET'))
+        name = rrec['full_name']
+        if not rrec['fork']:
+            print(f"{name} is not a fork, nothing to do")
+            return
+        print(f"{name} is forked from {rrec['parent']['full_name']}")
+        if not rrec['forks']:
+            print(f"{name} is not forked, can be detached")
+            return
+        print(f"{name} has child forks, must be re-created")
+
+    def __init__(self):
+        super().__init__()
+
+def _main():
+    try:
+        repo = _init_config()
+        ui = UnforkInfo()
+        ui.print_info(repo)
+    except Exception as exc:
+        scr.exc_exit(exc)
+
+def _init_config() -> Repo:
+    p: argparse.ArgumentParser = argparse.ArgumentParser(
+        description='Prints info about how a repo can be detached.' )
+    p.add_argument(
+            'repo', help='Repo to evaluate.'),
+    d = gh.dflt_creds_file
+    p.add_argument(
+            '-a', '--auth', metavar='File', type=scr.ReadableFile,
+            default=d, help=f"Credentials file to read. Default: {d}")
+    c = [l.lower() for l in scr.LOG_LEVELS.keys()]
+    d = 'info'
+    p.add_argument(
+            '-l', '--level', metavar='Lvl', choices=c, default=d,
+            help=f"Log level, one of [{', '.join(c)}]. Default: {d}")
+    d = 'OpenRiak'
+    p.add_argument(
+            '-p', '--proj', metavar='Org', default=d,
+            help=f"GitHub organization. Default: {d}")
+    p.add_argument(
+            '-d', '--debug', action='store_true',
+            help="""Print some additional info from certain operations.
+            On exception print stack trace. Debug output is always to stderr,
+            so it doesn't interfere with stdout redirection.
+            Note that this does NOT force any change in --level.
+            Implies --verbose."""),
+    p.add_argument(
+        '-v', '--verbose', action='store_true',
+        help='Make certain operations more verbose.')
+    args = vars(p.parse_args())
+    # Set these first so they're in effect for all remaining processing.
+    # Probably redundant, as the 'scr' module checks them ... for now.
+    if d := args['debug']:
+        print(f"Args: {args}", file=sys.stderr)
+    scr.DEBUG = d
+    scr.VERBOSE = (d or args['verbose'])
+    # All params except repo have default values, so we can just use them
+    # without further checks.
+    scr.PROJ_NAME = args['proj']
+    scr.init_log(args['level'])
+    scr.CONFIG = {'auth': gh.read_auth_token(args['auth'])}
+    return args['repo']
+
+_main()
