@@ -41,7 +41,7 @@ class GitHubActors(GitHubRest):
     def _actor_id(self, actor_name: Name, actor_type: str) -> ObjID:
         nids: NameIds
         if actor_type == 'Team':
-            nids = self._team_ids()
+            nids = self._team_ni_cache()[0]
         else:
             msg = f"unknown actor type '{actor_type}'"
             raise GitHubError(msg)
