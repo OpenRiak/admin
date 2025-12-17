@@ -22,7 +22,7 @@ import json
 import re
 import scr
 
-from gh import JSON, Name, Names, Repo, Repos
+from gh import JSON, Name, Names, Repo, Repos, URLs
 from ghactor import GitHubActors
 
 from typing import Optional, Union

@@ -48,6 +48,8 @@ RestRC  = int
 RestRCs = Sequence[RestRC]
 RestOp  = str   # 'DELETE', 'GET', 'POST', 'PUT', etc.
 UrlPath = str
+URL     = str
+URLs    = Sequence[URL]
 
 # Derived
 Actor   = Name
@@ -240,7 +242,7 @@ class GitHubRest:
                 return int(q_dict['page'])
 
     @staticmethod
-    def _url(path: UrlPath, query: Optional[Query] = None) -> str:
+    def _url(path: UrlPath, query: Optional[Query] = None) -> URL:
         if query:
             q_quot = urllib.parse.urlencode(
                 query, doseq=True, safe='', quote_via=urllib.parse.quote)

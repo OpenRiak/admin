@@ -34,6 +34,14 @@ class GitHubRepoCmds(GitHubRepos, CommandDispatcher):
         for branch in self._branches(repos[0]):
             print(branch)
 
+    def branch_urls(self) -> None:
+        orgurl = f"https://github.com/{self._org}"
+        for repo in self._repos():
+            if branches := self._branches(repo):
+                treeurl = f"{orgurl}/{repo}/tree/"
+                for branch in branches:
+                    print(treeurl + branch)
+
     def forks(self) -> None:
         for repo in self._repos():
             up, dn = self._forks(repo)
@@ -67,7 +75,16 @@ CommandDispatcher._cmd_help['branches'] = (
          + " specified team name(s). If no teams are specified, the teams"
          + " returned by the 'teams' command are used to construct the filter."
          + " The special team 'all' turns off filtering and prints all branch"
-         + "names in the repo.")
+         + " names in the repo.")
+    ])
+CommandDispatcher._cmd_help['branch-urls'] = (
+    '[-r {@<file> | <repo>[,<repo>,...]}] [-t {all | <team>,...}]', [
+        ("For each specified or configured repository, prints the URLs of each"
+         + " repo's branches that are prefixed with the specified team name(s)."
+         + " If no teams are specified, the teams returned by the 'teams'"
+         + " command are used to construct the filter."
+         + " The special team 'all' turns off filtering and prints all branch"
+         + " names in the repo(s).")
     ])
 CommandDispatcher._cmd_help['forks'] = (
     '[-r {@<file> | <repo>[,<repo>,...]}]', [

@@ -107,5 +107,26 @@
       { "type": "deletion" },
       { "type": "update" }
     ]
+  },
+  {
+    "name": "Branch pattern permissions for team 'contrib'",
+    "target": "branch",
+    "enforcement": "active",
+    "conditions": {
+      "ref_name": {
+        "exclude": [],
+        "include": [
+          "refs/heads/contrib/**"
+        ]
+      }
+    },
+    "bypass_actors": [
+      { "actor_name": "contrib", "actor_type": "Team", "bypass_mode": "always" }
+    ],
+    "rules": [
+      { "type": "creation" },
+      { "type": "deletion" },
+      { "type": "update" }
+    ]
   }
 ]
