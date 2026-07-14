@@ -25,7 +25,8 @@
       "ref_name": {
         "exclude": [
           "refs/heads/{nhse,tiot,wday}-develop-?.?",
-          "refs/heads/{nhse,tiot,wday}/**"
+          "refs/heads/{nhse,tiot,wday}/**",
+          "refs/heads/contrib/**"
         ],
         "include": [
           "refs/heads/*",
